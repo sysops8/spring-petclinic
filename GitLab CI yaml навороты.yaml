@@ -1,0 +1,229 @@
+# Добавить в самое начало файла:
+default:
+  image: maven:3.8.2-openjdk-11
+
+variables:
+  M2_EXTRA_OPTIONS: "-s .m2/settings.xml"
+  IMAGE_NAME: spring-petclinic
+  TAG: $CI_COMMIT_SHORT_SHA  # Лучше использовать короткий хэш
+
+stages:
+  - check
+  - unit-test
+  - build
+  - sonarscan
+  - dast
+  - security
+  - push
+  - dockerize
+  - deploy
+
+# -----------------------------------
+# Stage: check-version
+# -----------------------------------
+check-version:
+  stage: check
+  tags:
+    - k8s
+  script:
+    - mvn --version
+    - java -version
+
+# -----------------------------------
+# Stage: dependency-scan
+# -----------------------------------
+dependency-scan:
+  stage: check
+  image: owasp/dependency-check:latest
+  tags:
+    - docker-runner
+  script:  # Убрал dependencies, они здесь не нужны
+    - echo "Running OWASP Dependency-Check..."
+    - dependency-check.sh --project ${CI_PROJECT_NAME} --scan . --format HTML --format JSON --out ./dep-report
+    - HIGH=$(jq '.dependencies[]?.vulnerabilities[]? | select(.severity=="HIGH" or .severity=="CRITICAL")' ./dep-report/dependency-check-report.json 2>/dev/null | wc -l || echo "0")
+    - |
+      if [ "$HIGH" -gt 0 ]; then
+        echo "Found $HIGH high/critical vulnerabilities!"
+        exit 1
+      else
+        echo "No high/critical vulnerabilities found."
+      fi
+  artifacts:
+    paths:
+      - dep-report/
+    expire_in: 1 week
+  allow_failure: false
+
+# -----------------------------------
+# Stage: unit-tests
+# -----------------------------------
+unit-tests:
+  stage: unit-test
+  tags:
+    - k8s
+  script:  # Убрал dependencies
+    - echo "Running unit tests..."
+    - mvn test
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - target/surefire-reports/*.xml
+        - target/failsafe-reports/*.xml
+  allow_failure: false
+
+# -----------------------------------
+# Stage: build (WAR package)
+# -----------------------------------
+build-job:
+  stage: build
+  tags:
+    - k8s
+  dependencies: []  # Явно указать пустой массив или убрать
+  script:
+    - echo "Building the WAR file..."
+    - mvn clean package -DskipTests
+    - ls -la target/*.war
+  artifacts:
+    paths:
+      - target/*.war
+    expire_in: 1 week
+
+# -----------------------------------
+# Stage: SonarQube analysis
+# -----------------------------------
+sonarscan:
+  stage: sonarscan
+  tags:
+    - k8s
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: 0  # Для правильного анализа
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  script:
+    - sonar-scanner
+      -Dsonar.projectKey=${CI_PROJECT_NAME}
+      -Dsonar.sources=.
+      -Dsonar.host.url=${SONAR_HOST_URL}
+      -Dsonar.login=${SONAR_TOKEN}
+      -Dsonar.java.binaries=target/classes
+      -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+
+# -----------------------------------
+# Stage: DAST - OWASP ZAP
+# -----------------------------------
+dast-scan:
+  stage: dast
+  tags:
+    - docker-runner
+  image: owasp/zap2docker-stable:latest
+  variables:
+    TARGET_URL: "http://petclinic:8080"  # Изменен адрес
+  before_script:
+    - echo "Starting target application for DAST..."
+    # Здесь нужно добавить запуск приложения или убедиться, что оно уже запущено
+  script:
+    - echo "Running OWASP ZAP baseline scan against $TARGET_URL"
+    - zap-baseline.py -t $TARGET_URL -r zap_report.html -J zap_report.json
+    - |
+      HIGH=$(jq '.site[0].alerts[]? | select(.risk=="High")' zap_report.json 2>/dev/null | wc -l || echo "0")
+      if [ "$HIGH" -gt 0 ]; then
+        echo "Found $HIGH high severity issues!"
+        exit 1
+      else
+        echo "No high severity issues found."
+      fi
+  artifacts:
+    paths:
+      - zap_report.html
+      - zap_report.json
+    expire_in: 1 week
+  allow_failure: true
+
+# -----------------------------------
+# Stage: dockerize
+# -----------------------------------
+dockerize:
+  stage: dockerize
+  tags:
+    - docker-runner
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.0-debug
+    entrypoint: [""]
+  script:
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - /kaniko/executor 
+      --context "${CI_PROJECT_DIR}" 
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile" 
+      --destination "${CI_REGISTRY}/${CI_PROJECT_PATH}/${IMAGE_NAME}:${TAG}"  # Исправлен путь
+      --cache=true
+  only:
+    - main
+    - master
+    - tags
+
+# -----------------------------------
+# Stage: container security scan (Trivy)
+# -----------------------------------
+container-scan:
+  stage: security
+  tags:
+    - docker-runner
+  image: aquasec/trivy:latest
+  script:
+    - echo "Scanning Docker image for vulnerabilities..."
+    - trivy image ${CI_REGISTRY}/${CI_PROJECT_PATH}/${IMAGE_NAME}:${TAG} --exit-code 1 --severity HIGH,CRITICAL --format json -o trivy_report.json
+  artifacts:
+    paths:
+      - trivy_report.json
+    expire_in: 1 week
+  allow_failure: false
+  only:
+    - main
+    - master
+    - tags
+
+# -----------------------------------
+# Stage: push to Nexus
+# -----------------------------------
+push-to-nexus:
+  stage: push
+  tags:
+    - k8s
+  script:
+    - mvn $M2_EXTRA_OPTIONS clean deploy
+  only:
+    - main
+    - master
+    - tags
+
+# -----------------------------------
+# Stage: Deploy to Kubernetes
+# -----------------------------------
+deploy-to-kubernetes:
+  stage: deploy
+  tags:
+    - k8s
+  before_script:
+    - mkdir -p $HOME/.kube
+    - echo "$KUBECONFIG_CONTENT" > $HOME/.kube/config  # Изменено имя переменной
+    - chmod 600 $HOME/.kube/config
+    - kubectl cluster-info
+    - helm version
+  script:
+    - |
+      echo "Deploying Spring Petclinic with Helm..."
+      helm upgrade --install petclinic ./petclinic-chart \
+        --namespace ${K8S_NAMESPACE:-default} \
+        --set image.tag=${TAG} \
+        --set image.repository=${CI_REGISTRY}/${CI_PROJECT_PATH}/${IMAGE_NAME} \
+        --set image.pullSecret=regcred \
+        --atomic \
+        --timeout 5m \
+        --wait
+  only:
+    - main
+    - master
+  when: manual  # Рекомендую для deploy
